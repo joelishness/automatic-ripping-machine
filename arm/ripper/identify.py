@@ -8,25 +8,36 @@ import re
 import datetime
 import unicodedata
 import json
+from ast import literal_eval
+
 import pydvdid
 import xmltodict
 import arm.config.config as cfg
 
 from arm.ripper import utils
+from arm.ripper.ProcessHandler import arm_subprocess
 from arm.ui import db
 
 # flake8: noqa: W605
 from arm.ui import utils as ui_utils
 
 
-def check_if_mounted(mounted):
+def check_if_mounted(mount_return_code, findmnt_return_code):
     """
     Function to check if mounting disc was success
+     checking the return value of 2 linux shell functions;
+     mount and findmnt.  mount can, in rare occasions,
+     return no errors (0) yet still have not mounted
+     the drive as expected.  findmnt, ran after the
+     mount functions, confirms that the drive is indeed mounted.
      anything but 0 means we failed to mount disc
+     :param mount_return_code: The return value of the linux "mount" function
+     :param findmnt_return_code: The return value of the linux "findmnt" function
     """
-    logging.debug(f"OS mounted value: {mounted}")
+    logging.debug(f"OS mounted value: {mount_return_code}")
+    logging.debug(f"OS findmnt -M value: {findmnt_return_code}")
     success = False
-    if mounted == 0:
+    if mount_return_code == 0 and findmnt_return_code == 0:
         logging.info("Mounting disc was successful")
         success = True
     else:
@@ -41,7 +52,9 @@ def identify(job):
     if not os.path.exists(str(job.mountpoint)):
         os.makedirs(str(job.mountpoint))
     # Check and mount drive - log error if failed
-    mounted = check_if_mounted(os.system(f"mount {job.devpath}"))
+    mount_return_code = os.system(f"mount {job.mountpoint}")
+    findmnt_return_code = os.system(f"findmnt -M {job.mountpoint}")
+    mounted = check_if_mounted(mount_return_code, findmnt_return_code)
     # get_disc_type() checks local files, no need to run unless we can mount
     if mounted:
         # Check with the job class to get the correct disc type
@@ -175,15 +188,35 @@ def identify_dvd(job):
     # rip out any SKU's at the end of the line
     dvd_title = re.sub(r"SKU\b", "", dvd_title)
     logging.debug(f"dvd_title SKU$: {dvd_title}")
-
+    
     # Do we really need metaselector if we have got from ARM online db?
-    dvd_info_xml = metadata_selector(job, dvd_title, year)
-    logging.debug(f"DVD_INFO_XML: {dvd_info_xml}")
-    identify_loop(job, dvd_info_xml, dvd_title, year)
+    try:
+        dvd_info_xml = metadata_selector(job, dvd_title, year)
+        logging.debug(f"DVD_INFO_XML: {dvd_info_xml}")
+        identify_loop(job, dvd_info_xml, dvd_title, year)
+    except Exception:
+        dvd_info_xml = None
+        logging.debug("Cant connect to online service!")
     # Failsafe so that we always have a title.
     if job.title is None or job.title == "None":
         job.title = str(job.label)
         job.year = None
+
+    # Track 99 detection
+    # -Oy means output a python dict
+    output = arm_subprocess(["lsdvd", "-Oy", job.devpath])
+    if output:
+        try:
+            # literal_eval only accepts literals so we have to adjust the output slightly
+            tracks = literal_eval(re.sub(r"^.*\{", "{", output)).get("track", [])
+            logging.debug(f"Detected {len(tracks)} tracks")
+            if len(tracks) == 99:
+                job.has_track_99 = True
+                if cfg.arm_config["PREVENT_99"]:
+                    raise Exception("Track 99 found and PREVENT_99 is enabled")
+        except (SyntaxError, AttributeError) as e:
+            logging.error("Failed to parse lsdvd output", exc_info=e)
+
     return True
 
 
@@ -212,7 +245,10 @@ def get_video_details(job):
     logging.debug(f"Title: {title} | Year: {year}")
     logging.debug(f"Calling webservice with title: {title} and year: {year}")
 
-    identify_loop(job, None, title, year)
+    try:
+        identify_loop(job, None, title, year)
+    except Exception as error:
+        logging.info(f"Identification failed with the error: {error}. Continuing...")
 
 
 def update_job(job, search_results):

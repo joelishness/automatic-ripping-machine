@@ -28,7 +28,7 @@ function getRipperName(job, idsplit) {
     return ripperName;
 }
 
-function addJobItem(job) {
+function addJobItem(job, authenticated) {
     // Local server or remote
     const idsplit = job.job_id.split("_");
     console.log(`${idsplit[1]} - ${idsplit[0]}`)
@@ -44,7 +44,7 @@ function addJobItem(job) {
     }
     // Section 2 (Middle)  Contains Job info (status, type, device, start time, progress)
     x += buildMiddleSection(job);
-    x += buildRightSection(job, idsplit);
+    x += buildRightSection(job, idsplit, authenticated);
     // Close Job.card
     x += "</div></div></div></div></div></div></div>";
     return x;
@@ -55,10 +55,16 @@ function transcodingCheck(job) {
     if (job.status === "transcoding" && job.stage !== "" && job.progress || job.disctype === "music" && job.stage !== "") {
         x += `<div id="jobId${job.job_id}_stage"><strong>Stage: </strong>${job.stage}</div>`;
         x += `<div id="jobId${job.job_id}_progress" >`;
-        x += `<div class="progress"><div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar" 
-              aria-valuenow="${job.progress_round}" aria-valuemin="0" aria-valuemax="100" style="width: ${job.progress_round}%">
-              <small class="justify-content-center d-flex position-absolute w-100">${job.progress}%</small></div></div></div>
-              <div id="jobId${job.job_id}_eta"><strong>ETA: </strong>${job.eta}</div>`;
+        x += `<div class="progress">
+                <div class="progress-bar progress-bar-striped progress-bar-animated" role="progressbar"
+                aria-valuenow="${job.progress_round}" aria-valuemin="0" aria-valuemax="100"
+                style="width: ${job.progress_round}%; background-color: #cbcbcb;">
+                    <small class="justify-content-center d-flex position-absolute w-100" style="color: black; z-index: 2;">
+                        ${job.progress}%
+                    </small>
+                </div>
+              </div></div>`;
+        x += `<div id="jobId${job.job_id}_eta"><strong>ETA: </strong>${job.eta}</div>`;
     }
     // YYYY-MM-DD
     const d = new Date(Date.parse(job.start_time));
@@ -89,7 +95,7 @@ function posterCheck(job) {
         if (job.video_type === "Music") {
             image = 'music.png';
         } else {
-            image = 'none.jpg';
+            image = 'none.png';
         }
         x = `<img id="jobId${job.job_id}_poster_url" alt="poster img" src="/static/img/${image}" width="240px" class="img-thumbnail">`;
     }
@@ -118,7 +124,7 @@ function buildMiddleSection(job) {
     return x;
 }
 
-function buildRightSection(job, idsplit) {
+function buildRightSection(job, idsplit, authenticated) {
     let x;
     // idsplit[1] should only be undefined on the /database page
     if (idsplit[1] === undefined) {
@@ -137,13 +143,19 @@ function buildRightSection(job, idsplit) {
     x += `<div id="jobId${job.job_id}_MAXLENGTH"><strong>Max Length: </strong>${job.config.MAXLENGTH}</div>`;
     x += "</div>";
     // Section 3 (Right Bottom) Contains Buttons for arm json api
-    x += `<div class="card-body px-2 py-1"><div class="btn-group-vertical" role="group" aria-label="buttons" ${idsplit[0] !== "0" ? "style=\"display: none;\"" : ""}>
-          <button type="button" class="btn btn-primary" data-toggle="modal" data-target="#exampleModal" data-type="abandon" data-jobid="${idsplit[1]}" 
-          data-href="json?job=${idsplit[1]}&mode=abandon">Abandon Job</button>
-          <a href="logs?logfile=${job.logfile}&mode=full" class="btn btn-primary">View logfile</a>`;
-    x += musicCheck(job, idsplit);
-    x += `<button type="button" class="btn btn-primary" data-toggle="modal" data-target="#exampleModal" data-type="fixperms" 
-          data-jobid="${idsplit[1]}" data-href="json?mode=fixperms&job=${idsplit[1]}">Fix Permissions</button>`;
+    // Only show when authenticated
+    x += `<div class="card-body px-2 py-1">`;
+    if (authenticated === true) {
+        x += `<div class="btn-group-vertical" role="group" aria-label="buttons" ${idsplit[0] !== "0" ? "style=\"display: none;\"" : ""}>
+              <button type="button" class="btn btn-primary" data-toggle="modal" data-target="#exampleModal" data-type="abandon" data-jobid="${idsplit[1]}" 
+              data-href="json?job=${idsplit[1]}&mode=abandon">Abandon Job</button>
+              <a href="logs?logfile=${job.logfile}&mode=full" class="btn btn-primary">View logfile</a>`;
+        x += musicCheck(job, idsplit);
+        x += `<button type="button" class="btn btn-primary" data-toggle="modal" data-target="#exampleModal" data-type="fixperms" 
+              data-jobid="${idsplit[1]}" data-href="json?mode=fixperms&job=${idsplit[1]}">Fix Permissions</button>`;
+        x += `</div>`;
+    }
+    x += `</div>`;
     return x;
 }
 

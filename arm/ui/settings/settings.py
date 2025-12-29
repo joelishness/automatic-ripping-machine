@@ -10,19 +10,23 @@ Covers
 - systemdrivescan [GET]
 - update_arm [POST]
 - drive_eject [GET]
+- drive_remove [GET]
 - testapprise [GET]
+- updatesysinfo [GET]
 """
-
-import os
 import platform
 import importlib
 import re
 import subprocess
+from datetime import datetime
+import os
 
-from flask_login import LoginManager, login_required, \
+import sqlalchemy
+
+from flask_login import login_required, \
     current_user, login_user, UserMixin, logout_user  # noqa: F401
 from flask import render_template, request, flash, \
-    redirect, Blueprint
+    redirect, Blueprint, session, url_for
 
 import arm.ui.utils as ui_utils
 from arm.ui import app, db
@@ -31,7 +35,7 @@ from arm.models.system_drives import SystemDrives
 from arm.models.system_info import SystemInfo
 from arm.models.ui_settings import UISettings
 import arm.config.config as cfg
-from arm.ui.settings import DriveUtils
+from arm.ui.settings import DriveUtils as drive_utils
 from arm.ui.forms import SettingsForm, UiSettingsForm, AbcdeForm, SystemInfoDrives
 from arm.ui.settings.ServerUtil import ServerUtil
 import arm.ripper.utils as ripper_utils
@@ -39,10 +43,19 @@ import arm.ripper.utils as ripper_utils
 route_settings = Blueprint('route_settings', __name__,
                            template_folder='templates',
                            static_folder='../static')
+REDIRECT_SETTINGS = "route_settings.settings"
 
-# Page definitions
-page_settings = "settings/settings.html"
-redirect_settings = "/settings"
+
+def mask_last(value, n=4):
+    """
+    Replaces the last `n` characters of a string with asterisks.
+    """
+    if not isinstance(value, str):
+        return value
+    return value[:-n] + '*' * n if len(value) > n else '*' * len(value)
+
+
+route_settings.add_app_template_filter(mask_last, name='mask_last')
 
 
 @route_settings.route('/settings')
@@ -54,53 +67,73 @@ def settings():
     Overview - allows the user to update the all configs of A.R.M without
     needing to open a text editor
     """
-    global page_settings
 
     # stats for info page
-    with open(os.path.join(cfg.arm_config["INSTALLPATH"], 'VERSION')) as version_file:
-        version = version_file.read().strip()
     failed_rips = Job.query.filter_by(status="fail").count()
     total_rips = Job.query.filter_by().count()
     movies = Job.query.filter_by(video_type="movie").count()
     series = Job.query.filter_by(video_type="series").count()
     cds = Job.query.filter_by(disctype="music").count()
 
-    stats = {'python_version': platform.python_version(),
-             'arm_version': version,
-             'git_commit': ui_utils.get_git_revision_hash(),
+    # Get the current server time and timezone
+    server_timezone = os.environ.get("TZ", "Etc/UTC")
+    current_time = datetime.now()
+    server_datetime = current_time.strftime(cfg.arm_config['DATE_FORMAT'])
+    [arm_version_local, arm_version_remote] = ui_utils.git_check_version()
+    local_git_hash = ui_utils.get_git_revision_hash()
+
+    stats = {'server_datetime': server_datetime,
+             'server_timezone': server_timezone,
+             'python_version': platform.python_version(),
+             'arm_version_local': arm_version_local,
+             'arm_version_remote': arm_version_remote,
+             'git_commit': local_git_hash,
              'movies_ripped': movies,
              'series_ripped': series,
              'cds_ripped': cds,
              'no_failed_jobs': failed_rips,
              'total_rips': total_rips,
-             'updated': ui_utils.git_check_updates(ui_utils.get_git_revision_hash()),
+             'updated': ui_utils.git_check_updates(local_git_hash),
              'hw_support': check_hw_transcode_support()
              }
 
     # ARM UI config
     armui_cfg = ui_utils.arm_db_cfg()
 
-    # System details in class server
+    # Get system details from Server Info and Config
     server = SystemInfo.query.filter_by(id="1").first()
     serverutil = ServerUtil()
-
-    # System details in class server
     arm_path = cfg.arm_config['TRANSCODE_PATH']
     media_path = cfg.arm_config['COMPLETED_PATH']
 
-    # form_drive = SystemInfoDrives(request.form)
     # System Drives (CD/DVD/Blueray drives)
-    drives = DriveUtils.drives_check_status()
+    drive_utils.update_job_status()
+    drives = drive_utils.get_drives()
+    drive_utils.update_tray_status(drives)
+    form_drive = SystemInfoDrives(request.form)
 
     # Load up the comments.json, so we can comment the arm.yaml
     comments = ui_utils.generate_comments()
     form = SettingsForm()
 
-    return render_template(page_settings, settings=cfg.arm_config, ui_settings=armui_cfg,
-                           stats=stats, apprise_cfg=cfg.apprise_config,
-                           form=form, jsoncomments=comments, abcde_cfg=cfg.abcde_config,
-                           server=server, serverutil=serverutil, arm_path=arm_path, media_path=media_path,
-                           drives=drives, form_drive=False)
+    session["page_title"] = "Settings"
+
+    app.logger.debug(f"stats: {stats}")
+
+    return render_template("settings/settings.html",
+                           settings=cfg.arm_config,
+                           ui_settings=armui_cfg,
+                           stats=stats,
+                           apprise_cfg=cfg.apprise_config,
+                           form=form,
+                           jsoncomments=comments,
+                           abcde_cfg=cfg.abcde_config,
+                           server=server,
+                           serverutil=serverutil,
+                           arm_path=arm_path,
+                           media_path=media_path,
+                           drives=drives,
+                           form_drive=form_drive)
 
 
 def check_hw_transcode_support():
@@ -158,6 +191,10 @@ def save_settings():
             settings_file.close()
         success = True
         importlib.reload(cfg)
+        # Set the ARM Log level to the config
+        app.logger.info(f"Setting log level to: {cfg.arm_config['LOGLEVEL']}")
+        app.logger.setLevel(cfg.arm_config['LOGLEVEL'])
+
     # If we get to here there was no post data
     return {'success': success, 'settings': cfg.arm_config, 'form': 'arm ripper settings'}
 
@@ -199,7 +236,7 @@ def save_abcde():
     """
     Page - save_abcde_settings
     Method - POST
-    Overview - Save 'abcde Config' page settings to database. Not a user page
+    Overview - Save 'abcde Config' page settings to the database. Not a user page
     """
     success = False
     abcde_cfg_str = ""
@@ -216,8 +253,11 @@ def save_abcde():
         success = True
         # Update the abcde config
         cfg.abcde_config = clean_abcde_str
-    # If we get to here there was no post data
-    return {'success': success, 'settings': clean_abcde_str, 'form': 'abcde config'}
+
+    # If we get to here, there was no post-data
+    return {'success': success,
+            'settings': clean_abcde_str,
+            'form': 'abcde config'}
 
 
 @route_settings.route('/save_apprise_cfg', methods=['POST'])
@@ -251,23 +291,27 @@ def server_info():
     Method - POST
     Overview - Save 'System Info' page settings to database. Not a user page
     """
-    global redirect_settings
-
     # System Drives (CD/DVD/Blueray drives)
     form_drive = SystemInfoDrives(request.form)
     if request.method == 'POST' and form_drive.validate():
         # Return for POST
         app.logger.debug(
-            "Drive id: " + str(form_drive.id.data) +
-            " Updated db description: " + form_drive.description.data)
+            f"Drive id: {str(form_drive.id.data)} " +
+            f"Updated name: {str(form_drive.name.data)} " +
+            f"Updated description: [{str(form_drive.description.data)}] " +
+            f"Updated mode: [{str(form_drive.drive_mode.data)}]")
         drive = SystemDrives.query.filter_by(drive_id=form_drive.id.data).first()
         drive.description = str(form_drive.description.data).strip()
+        drive.name = str(form_drive.name.data).strip()
+        drive.drive_mode = str(form_drive.drive_mode.data).strip()
         db.session.commit()
-        # Return to systeminfo page (refresh page)
-        return redirect(redirect_settings)
+        flash(f"Updated Drive {drive.name} details", "success")
+        # Return to the systeminfo page (refresh page)
+        return redirect(url_for(REDIRECT_SETTINGS))
     else:
+        flash("Error: Unable to update drive details", "error")
         # Return for GET
-        return redirect(redirect_settings)
+        return redirect(url_for(REDIRECT_SETTINGS))
 
 
 @route_settings.route('/systemdrivescan')
@@ -277,31 +321,90 @@ def system_drive_scan():
     Method - GET
     Overview - Scan for the system drives and update the database.
     """
-    global redirect_settings
-    # Update to scan for changes from system
-    new_count = DriveUtils.drives_update()
+    # Update to scan for changes to the ripper system
+    new_count = drive_utils.drives_update()
     flash(f"ARM found {new_count} new drives", "success")
-    return redirect(redirect_settings)
+    return redirect(url_for(REDIRECT_SETTINGS))
 
 
-@route_settings.route('/update_arm', methods=['POST'])
+@route_settings.route('/drive/eject/<eject_id>')
 @login_required
-def update_git():
-    """Update arm via git command line"""
-    return ui_utils.git_get_updates()
+def drive_eject(eject_id):
+    """
+    Server System - change state of CD/DVD/BluRay drive - toggle eject status
+    """
+    try:
+        drive = SystemDrives.query.filter_by(drive_id=eject_id).one()
+    except sqlalchemy.exc.NoResultFound as e:
+        app.logger.error(f"Drive eject encountered an error: {e}")
+        flash(f"Cannot find drive {eject_id} in database.", "error")
+        return redirect(url_for(REDIRECT_SETTINGS))
+    # block for running jobs
+    if drive.job_id_current:
+        drive.tray_status()  # update tray status
+        if not drive.open:  # allow closing
+            flash(f"Job [{drive.job_id_current}] in progress. Cannot eject {eject_id}.", "error")
+            return redirect(url_for(REDIRECT_SETTINGS))
+    # toggle open/close (with non-critical error)
+    if (error := drive.eject(method="toggle", logger=app.logger)) is not None:
+        flash(error, "error")
+    return redirect(url_for(REDIRECT_SETTINGS))
 
 
-@route_settings.route('/driveeject/<id>')
+@route_settings.route('/drive/remove/<remove_id>')
 @login_required
-def drive_eject(id):
+def drive_remove(remove_id):
     """
-    Server System  - change state of CD/DVD/BluRay drive - toggle eject
+    Server System - remove a drive from the ARM UI
     """
-    global redirect_settings
-    drive = SystemDrives.query.filter_by(drive_id=id).first()
-    drive.open_close()
-    db.session.commit()
-    return redirect(redirect_settings)
+    try:
+        app.logger.debug(f"Removing drive {remove_id}")
+        drive = SystemDrives.query.filter_by(drive_id=remove_id).first()
+        dev_path = drive.mount
+        SystemDrives.query.filter_by(drive_id=remove_id).delete()
+        db.session.commit()
+        flash(f"Removed drive [{dev_path}] from ARM", "success")
+    except Exception as e:
+        app.logger.error(f"Drive removal encountered an error: {e}")
+        flash("Drive unable to be removed, check logs for error", "error")
+    return redirect(url_for(REDIRECT_SETTINGS))
+
+
+@route_settings.route('/drive/manual/<manual_id>')
+@login_required
+def drive_manual(manual_id):
+    """
+    Manually start a job on ARM
+    """
+
+    drive = SystemDrives.query.filter_by(drive_id=manual_id).first()
+    dev_path = drive.mount.lstrip('/dev/')
+
+    cmd = f"/opt/arm/scripts/docker/docker_arm_wrapper.sh {dev_path}"
+    app.logger.debug(f"Running command[{cmd}]")
+
+    # Manually start ARM if the udev rules are not working for some reason
+    try:
+        manual_process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        stdout, stderr = manual_process.communicate()
+
+        if manual_process.returncode != 0:
+            raise subprocess.CalledProcessError(manual_process.returncode, cmd, output=stdout, stderr=stderr)
+
+        message = f"Manually starting a job on Drive: '{drive.name}'"
+        status = "success"
+        app.logger.debug(stdout)
+
+    except subprocess.CalledProcessError as e:
+        message = f"Failed to start a job on Drive: '{drive.name}' See logs for info"
+        status = "danger"
+        app.logger.error(message)
+        app.logger.error(f"error: {e}")
+        app.logger.error(f"stdout: {e.output}")
+        app.logger.error(f"stderr: {e.stderr}")
+
+    flash(message, status)
+    return redirect('/settings')
 
 
 @route_settings.route('/testapprise')
@@ -311,8 +414,44 @@ def testapprise():
     Method - GET
     Overview - Send a test notification to Apprise.
     """
-    global redirect_settings
     # Send a sample notification
-    ripper_utils.notify("/dev/null", "ARM notification", "This is a notification by the ARM-Notification Test!")
+    message = "This is a notification by the ARM-Notification Test!"
+    if cfg.arm_config["UI_BASE_URL"] and cfg.arm_config["WEBSERVER_PORT"]:
+        message = message + f" Server URL: http://{cfg.arm_config['UI_BASE_URL']}:{cfg.arm_config['WEBSERVER_PORT']}"
+    ripper_utils.notify(None, "ARM notification", message)
     flash("Test notification sent ", "success")
-    return redirect(redirect_settings)
+    return redirect(url_for(REDIRECT_SETTINGS))
+
+
+@route_settings.route('/updatesysinfo')
+def update_sysinfo():
+    """
+    Update system information
+    """
+    # Get current system information from database
+    current_system = SystemInfo.query.first()
+    # Query system for new information
+    new_system = SystemInfo()
+
+    app.logger.debug("****** System Information ******")
+    if current_system is not None:
+        app.logger.debug(f"Name old [{current_system.name}] new [{new_system.name}]")
+        app.logger.debug(f"Name old [{current_system.cpu}] new [{new_system.cpu}]")
+        app.logger.debug(f"Name old [{current_system.mem_total}] new [{new_system.mem_total}]")
+        current_system.name = new_system.name
+        current_system.cpu = new_system.cpu
+        current_system.mem_total = new_system.mem_total
+        db.session.add(current_system)
+    else:
+        app.logger.debug(f"Name old [No Info] new [{new_system.name}]")
+        app.logger.debug(f"Name old [No Info] new [{new_system.cpu}]")
+        app.logger.debug(f"Name old [No Info] new [{new_system.mem_total}]")
+        db.session.add(new_system)
+
+    app.logger.debug("****** End System Information ******")
+    app.logger.info(f"Updated CPU Details with new info - {new_system.name} - {new_system.cpu} - "
+                    f"{new_system.mem_total}")
+
+    db.session.commit()
+
+    return redirect(url_for(REDIRECT_SETTINGS))

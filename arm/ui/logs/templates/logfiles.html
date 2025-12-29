@@ -1,7 +1,4 @@
 {% extends "base.html" %}
-{% block title %}Logs{% endblock %}
-
-{% block nav %}{{ super() }}{% endblock %}
 
 {% block content %}
 <link rel="stylesheet" href="{{ url_for('static', filename='css/job_details.css') }}">
@@ -73,7 +70,7 @@
                             {% for file in files %}
                                 <tr>
                                     <th scope="row" class="text-wrap">{{ file[0]|truncate(30, True) }}</th>
-                                    <td class="text-wrap">{{ file[2] }}</td>
+                                    <td class="text-wrap">{{ file[1] }}</td>
                                     <td>{{ file[3] }}</td>
                                     <td><a href="logs?logfile={{ file[0] }}&mode=tail">tail</a></td>
                                     <td><a href="logs?logfile={{ file[0] }}&mode=armcat">arm</a></td>

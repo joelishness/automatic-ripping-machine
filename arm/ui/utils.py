@@ -10,13 +10,14 @@ import subprocess
 import re
 from datetime import datetime
 from pathlib import Path
-
+from sqlalchemy.exc import SQLAlchemyError
 from time import strftime, localtime, time, sleep
 
 import bcrypt
 import requests
 from werkzeug.routing import ValidationError
 from flask.logging import default_handler  # noqa: F401
+from flask_login import current_user
 
 import arm.config.config as cfg
 from arm.config.config_utils import arm_yaml_test_bool
@@ -172,13 +173,13 @@ def arm_db_check():
         if db_revision.version_num == head_revision:
             db_current = True
             app.logger.debug(
-                        f"Database is current. Head: {head_revision}" +
-                        f"DB: {db_revision.version_num}")
+                f"Database is current. Head: {head_revision}" +
+                f"DB: {db_revision.version_num}")
         else:
             db_current = False
             app.logger.info(
-                        "Database is not current, update required." +
-                        f" Head: {head_revision} DB: {db_revision.version_num}")
+                "Database is not current, update required." +
+                f" Head: {head_revision} DB: {db_revision.version_num}")
     else:
         db_exists = False
         db_current = False
@@ -234,15 +235,15 @@ def arm_db_migrate():
     db_revision = arm_db_get()
 
     app.logger.info(
-                "Database out of date." +
-                f" Head is {head_revision} and database is {db_revision.version_num}." +
-                " Upgrading database...")
+        "Database out of date." +
+        f" Head is {head_revision} and database is {db_revision.version_num}." +
+        " Upgrading database...")
     with app.app_context():
         time = datetime.now()
         timestamp = time.strftime("%Y-%m-%d_%H%M")
         app.logger.info(
-                    f"Backing up database '{db_file}' " +
-                    f"to '{db_file}_migration_{timestamp}'.")
+            f"Backing up database '{db_file}' " +
+            f"to '{db_file}_migration_{timestamp}'.")
         shutil.copy(db_file, db_file + "_migration_" + timestamp)
         flask_migrate.upgrade(mig_dir)
     app.logger.info("Upgrade complete.  Validating version level...")
@@ -255,9 +256,9 @@ def arm_db_migrate():
         arm_db_initialise()
     else:
         app.logger.error(
-                    "Database is still out of date. " +
-                    f"Head is {head_revision} and database " +
-                    f"is {db_revision.version_num}.  Exiting arm.")
+            "Database is still out of date. " +
+            f"Head is {head_revision} and database " +
+            f"is {db_revision.version_num}.  Exiting arm.")
 
 
 def arm_db_initialise():
@@ -311,7 +312,7 @@ def get_info(directory):
             file_stats = os.stat(os.path.join(directory, i))
             file_size = os.path.getsize(os.path.join(directory, i))
             file_size = round((file_size / 1024), 1)
-            file_size = f"{file_size :,.1f}"
+            file_size = f"{file_size:,.1f}"
             create_time = strftime(cfg.arm_config['DATE_FORMAT'], localtime(file_stats.st_ctime))
             access_time = strftime(cfg.arm_config['DATE_FORMAT'], localtime(file_stats.st_atime))
             # [file,most_recent_access,created, file_size]
@@ -370,7 +371,7 @@ def generate_full_log(full_path):
             while True:
                 yield read_log_file.read()
                 sleep(1)
-    except Exception:
+    except IOError:
         try:
             with open(full_path, encoding="utf8", errors='ignore') as read_log_file:
                 while True:
@@ -407,7 +408,8 @@ def setup_database():
         app.logger.debug(f"Number of admins: {len(admins)}")
         if len(admins) > 0:
             return True
-    except Exception:
+    except SQLAlchemyError as e:
+        app.logger.debug(f"SQLAlchemy error: {e}")
         app.logger.debug("Couldn't find a user table")
     else:
         app.logger.debug("Found User table but didnt find any admins...")
@@ -433,7 +435,8 @@ def setup_database():
         DriveUtils.drives_update()
         app.logger.debug("DB Init - Drive info loaded")
         return True
-    except Exception:
+    except SQLAlchemyError as e:
+        app.logger.debug(f"SQLAlchemy error: {e}")
         app.logger.debug("Couldn't create all")
     return False
 
@@ -530,7 +533,7 @@ def fix_permissions(j_id):
     # If there is no path saved in the job
     if not job.path:
         # Check logfile still exists
-        validate_logfile(job.logfile, "true", Path(os.path.join(cfg.arm_config['LOGPATH'], job.logfile)))
+        validate_logfile(job.logfile, "true", Path(os.path.join(str(cfg.arm_config['LOGPATH']), job.logfile)))
         # Find the correct path to use for fixing perms
         directory_to_traverse = find_folder_in_log(os.path.join(cfg.arm_config['LOGPATH'], job.logfile),
                                                    os.path.join(job.config.COMPLETED_PATH,
@@ -650,9 +653,17 @@ def build_arm_cfg(form_data, comments):
     # This really should be hard coded.
     app.logger.debug("save_settings: START")
     for key, value in form_data.items():
-        app.logger.debug(f"save_settings: current key {key} = {value} ")
+        # Skip the Cross Site Request Forgery (CSRF) token
         if key == "csrf_token":
             continue
+        # Check if value contains "KEY" or "API" (any case)
+        elif re.search(r"_KEY|_API|_PASSWORD", key):
+            key_value = "####--redacted--####"
+        else:
+            key_value = value
+        # Print output
+        app.logger.debug(f"save_settings: [{key}] = {key_value} ")
+
         # Add any grouping comments
         arm_cfg += config_utils.arm_yaml_check_groups(comments, key)
         # Check for comments for this key in comments.json, add them if they exist
@@ -667,6 +678,7 @@ def build_arm_cfg(form_data, comments):
         except ValueError:
             # Test if value is Boolean
             arm_cfg += config_utils.arm_yaml_test_bool(key, value)
+
     app.logger.debug("save_settings: FINISH")
     return arm_cfg
 
@@ -681,9 +693,17 @@ def build_apprise_cfg(form_data):
     app.logger.debug("save_apprise: START")
     apprise_cfg = "\n\n"
     for key, value in form_data.items():
-        app.logger.debug(f"save_apprise: current key {key} = {value} ")
+        # Skip the Cross Site Request Forgery (CSRF) token
         if key == "csrf_token":
             continue
+        # Check if value contains "KEY" or "API" (any case)
+        elif re.search(r"KEY|API|PASS|TOKEN|SECRET", key):
+            key_value = "####--redacted--####"
+        else:
+            key_value = value
+        # Print output
+        app.logger.debug(f"save_settings: [{key}] = {key_value} ")
+
         # test if key value is an int
         try:
             post_value = int(value)
@@ -837,33 +857,123 @@ def import_movie_add(poster_image, imdb_id, movie_group, my_path):
 
 def get_git_revision_hash() -> str:
     """Get full hash of current git commit"""
-    return subprocess.check_output(['git', 'rev-parse', 'HEAD'],
-                                   cwd=cfg.arm_config['INSTALLPATH']).decode('ascii').strip()
+    git_hash: str = 'unknown'
+    try:
+        git_hash = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                                           cwd=cfg.arm_config['INSTALLPATH']).decode('ascii').strip()
+        # Trunkate to seven characters (aligns with the github commit values reported)
+        git_hash = git_hash[:7]
+        app.logger.debug(f"GIT revision: {git_hash}")
+    except subprocess.CalledProcessError as e:
+        app.logger.debug(f"GIT revision error: {e}")
+
+    return git_hash
 
 
 def get_git_revision_short_hash() -> str:
     """Get short hash of current git commit"""
-    return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'],
-                                   cwd=cfg.arm_config['INSTALLPATH']).decode('ascii').strip()
+    git_hash: str = 'unknown'
+    try:
+        subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'],
+                                cwd=cfg.arm_config['INSTALLPATH']).decode('ascii').strip()
+    except subprocess.CalledProcessError as e:
+        app.logger.debug(f"GIT revision error: {e}")
+
+    return git_hash
 
 
 def git_check_updates(current_hash) -> bool:
-    """Check if we are on latest commit"""
-    git_update = subprocess.run(['git', 'fetch',
-                                 'https://github.com/automatic-ripping-machine/automatic-ripping-machine'],
-                                cwd=cfg.arm_config['INSTALLPATH'], check=False)
-    # git for-each-ref refs/remotes/origin --sort="-committerdate" | head -1
-    git_log = subprocess.check_output('git for-each-ref refs/remotes/origin --sort="-committerdate" | head -1',
-                                      shell=True, cwd="/opt/arm").decode('ascii').strip()
-    app.logger.debug(git_update.returncode)
-    app.logger.debug(git_log)
-    app.logger.debug(current_hash)
-    app.logger.debug(bool(re.search(rf"\A{current_hash}", git_log)))
-    return bool(re.search(rf"\A{current_hash}", git_log))
+    """
+    Check the ARM commit hash against the remote (GitHub) commit hash
+    :param
+        current_hash: str - string of current ARM commit hash
+    :return:
+        arm_current: Bool - True for no update (or exceptions), False for update possible
+    """
+    # GitHub API url - branch main
+    url = "https://api.github.com/repos/automatic-ripping-machine/automatic-ripping-machine/commits/main"
+    arm_current = True      # set True, any exceptions will return a true value
+
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()  # Raise an error for HTTP failures (4xx, 5xx)
+
+        latest_commit = response.json().get("sha", "").strip()
+        if not latest_commit:
+            app.logger.error("Failed to retrieve latest commit hash from GitHub API.")
+
+        # Compare local and remote hashes
+        arm_current = latest_commit.startswith(current_hash)
+
+        app.logger.debug(f"Remote hash: {latest_commit}")
+        app.logger.debug(f"Local hash: {current_hash}")
+        app.logger.debug(f"ARM current: {arm_current}")
+
+    except requests.RequestException as e:
+        app.logger.error(f"GitHub API request failed: {e}")
+
+    return arm_current
 
 
-def git_get_updates() -> dict:
-    """update arm"""
-    git_log = subprocess.run(['git', 'pull'], cwd=cfg.arm_config['INSTALLPATH'], check=False)
-    return {'stdout': git_log.stdout, 'stderr': git_log.stderr,
-            'return_code': git_log.returncode, 'form': 'ARM Update', "success": (git_log.returncode == 0)}
+def git_check_version():
+    """
+    Check the current ARM version locally against the remote (GitHub) version.
+
+    This function compares the installed ARM version with the latest version available
+    in the remote GitHub repository.
+
+    :return:
+        tuple: (local_version, remote_version)
+            - local_version (str): The version currently installed locally (from the VERSION file).
+            - remote_version (str): The latest version available in the remote repository.
+    """
+
+    install_path = cfg.arm_config['INSTALLPATH']
+
+    # Read the local version from the VERSION file
+    version_file_path = os.path.join(install_path, 'VERSION')
+    try:
+        with open(version_file_path) as version_file:
+            local_version = version_file.read().strip()
+    except FileNotFoundError as e:
+        app.logger.debug(f"Error - ARM Local Version file not found: {e}")
+    except IOError as e:
+        app.logger.debug(f"Error - ARM Local Version file error: {e}")
+
+    # Read the remote version from Git (without modifying local files)
+    try:
+        remote_version = subprocess.check_output(
+            'git show origin/HEAD:VERSION', shell=True, cwd=install_path
+        ).decode('ascii').strip()
+    except subprocess.CalledProcessError as e:
+        app.logger.debug(f"Error - ARM Remote Version error: {e}")
+        remote_version = "Unknown"
+
+    app.logger.debug(f"Local version: {local_version}")
+    app.logger.debug(f"Remote version: {remote_version}")
+
+    return local_version, remote_version
+
+
+def authenticated_state() -> bool:
+    """
+    Determines whether the current user is considered authenticated.
+
+    This function checks the application's configuration to see if login
+    authentication is disabled. If login is disabled, it automatically
+    returns `True`, indicating that the user is authenticated. Otherwise,
+    it checks the `current_user.is_authenticated` attribute provided by
+    Flask-Login to determine if the user is logged in.
+
+    Returns:
+        bool: `True` if the user is authenticated, either by bypassing
+        the login requirement or by being a logged-in user; `False` otherwise.
+    """
+    authenticated = False
+    if cfg.arm_config['DISABLE_LOGIN']:
+        authenticated = True
+    else:
+        if current_user.is_authenticated:
+            authenticated = True
+
+    return authenticated
